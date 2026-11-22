@@ -33,6 +33,19 @@ def main() -> None:
             "severity": "critical",
             "burst": i,
         })
+    # 两次设备重启（reboot 无需 port：本机全部端口回到未知）
+    events.append({
+        "ts_ms": BASE_MS + 200_000,
+        "switch": "sw-core-01",
+        "event": "reboot",
+        "severity": "critical",
+    })
+    events.append({
+        "ts_ms": BASE_MS + 400_000,
+        "switch": "sw-access-02",
+        "event": "reboot",
+        "severity": "warning",
+    })
     rng.shuffle(events)  # 乱序
 
     out = Path(__file__).resolve().parent.parent / "logs" / "port_events_shuffled.ndjson"

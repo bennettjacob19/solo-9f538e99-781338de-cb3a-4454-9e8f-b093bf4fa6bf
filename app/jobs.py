@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Optional
 
 from .config import Settings
+from .portindex import IndexManager, QueryResult
 from .sorter import SortError, external_sort
 
 
@@ -76,9 +77,12 @@ class JobManager:
         self._executor = ThreadPoolExecutor(
             max_workers=settings.max_workers, thread_name_prefix="sort-worker"
         )
+        # 端口状态区间索引：按已完成作业懒构建，进程内缓存
+        self.indexes = IndexManager(result_path=self.result_path, ts_field=settings.ts_field)
 
     def shutdown(self) -> None:
         self._executor.shutdown(wait=True)
+        self.indexes.shutdown()
 
     # ---- 日志目录 ----
 
@@ -181,6 +185,15 @@ class JobManager:
 
     def result_path(self, job_id: str) -> Path:
         return self.settings.results_dir / f"{job_id}.ndjson"
+
+    def port_status(self, job_id: str, switch: str, port: str,
+                    start_ms: int, end_ms: int) -> QueryResult:
+        """查询端口在 [start_ms, end_ms) 的在线/掉线/未知区间。
+
+        首次查询触发该作业成品的索引构建；并发查询共用同一次构建；
+        索引未就绪时返回构建状态（调用方据此报告，不阻塞等待）。
+        """
+        return self.indexes.query(job_id, switch, port, start_ms, end_ms)
 
     # ---- 调度 ----
 

@@ -6,8 +6,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from .config import Settings
@@ -18,6 +18,7 @@ from .jobs import (
     JobState,
     LogNotFound,
 )
+from .portindex import IndexState
 
 
 def _iso(ts: Optional[float]) -> Optional[str]:
@@ -67,7 +68,9 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         description=(
             "交换机故障复盘：按 UTC 毫秒升序回放端口事件。"
             "流程：GET /api/logs 选文件 → POST /api/jobs 提交 → "
-            "GET /api/jobs/{job_id} 查状态 → GET /api/jobs/{job_id}/download 下载完整结果。"
+            "GET /api/jobs/{job_id} 查状态 → GET /api/jobs/{job_id}/download 下载完整结果；"
+            "作业完成后可用 GET /api/jobs/{job_id}/port-status 按 switch/port/毫秒起止"
+            "查询端口在线、掉线与未知区间（首次查询触发索引构建）。"
         ),
         lifespan=lifespan,
     )
@@ -124,6 +127,66 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             path,
             media_type="application/x-ndjson",
             filename=f"{stem}.sorted.ndjson",
+        )
+
+    @app.get(
+        "/api/jobs/{job_id}/port-status",
+        summary="查询端口在 [起,止) 内的在线/掉线/未知区间（仅已完成作业）",
+    )
+    def port_status(
+        job_id: str,
+        switch: str = Query(..., description="交换机名", examples=["sw-core-01"]),
+        port: str = Query(..., description="端口名", examples=["Eth1/1"]),
+        start_ms: int = Query(
+            ..., description="区间起点（UTC 毫秒，含）", examples=[1795248900000]
+        ),
+        end_ms: int = Query(
+            ..., description="区间终点（UTC 毫秒，不含）", examples=[1795249500000]
+        ),
+    ):
+        snap = manager.snapshot(job_id)
+        if snap is None:
+            raise HTTPException(status_code=404, detail=f"作业不存在：{job_id}")
+        if snap["state"] != JobState.COMPLETED:
+            raise HTTPException(
+                status_code=409,
+                detail=f"作业当前状态为 {snap['state'].value}，仅已完成作业可查询端口状态",
+            )
+        if not switch.strip():
+            raise HTTPException(status_code=400, detail="switch 不能为空")
+        if not port.strip():
+            raise HTTPException(status_code=400, detail="port 不能为空")
+        if start_ms >= end_ms:
+            raise HTTPException(
+                status_code=400,
+                detail=f"起止非法：start_ms（{start_ms}）必须小于 end_ms（{end_ms}）",
+            )
+        result = manager.port_status(job_id, switch, port, start_ms, end_ms)
+        if result.state == IndexState.READY:
+            return {
+                "job_id": job_id,
+                "switch": switch,
+                "port": port,
+                "start_ms": start_ms,
+                "end_ms": end_ms,
+                "intervals": result.intervals,
+            }
+        if result.state == IndexState.BUILDING:
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "job_id": job_id,
+                    "index_state": IndexState.BUILDING.value,
+                    "attempts": result.attempts,
+                    "detail": "索引构建中，完成后本查询返回区间结果",
+                },
+            )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"索引构建失败：{result.error}；"
+                "已触发重试（重新构建），稍后再次查询即可（原结果文件仍可下载）"
+            ),
         )
 
     @app.get("/api/quota", summary="临时盘配额使用情况")
